@@ -1,4 +1,5 @@
 import Cocoa
+import ServiceManagement
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
@@ -10,11 +11,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var slider: NSSlider!
     private var deviceMenuItem: NSMenuItem!
     private var muteMenuItem: NSMenuItem!
+    private var loginMenuItem: NSMenuItem!
 
     /// Keyboard step: 1/16, matching macOS's default volume increment.
     private let step: Float = 1.0 / 16.0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Allow enabling login-at-launch from the command line (used by the
+        // installer/build step) without the user opening the menu.
+        if CommandLine.arguments.contains("--enable-login") {
+            setLaunchAtLogin(true)
+        }
+
         setupStatusItem()
         setupMediaKeys()
 
@@ -45,6 +53,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         muteMenuItem = NSMenuItem(title: "Mute", action: #selector(toggleMute), keyEquivalent: "")
         muteMenuItem.target = self
         menu.addItem(muteMenuItem)
+
+        menu.addItem(.separator())
+
+        loginMenuItem = NSMenuItem(title: "Launch at Login",
+                                   action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        loginMenuItem.target = self
+        menu.addItem(loginMenuItem)
 
         menu.addItem(.separator())
 
@@ -114,6 +129,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
+    // MARK: - Launch at login
+
+    private var isLaunchAtLoginEnabled: Bool {
+        SMAppService.mainApp.status == .enabled
+    }
+
+    private func setLaunchAtLogin(_ enable: Bool) {
+        do {
+            if enable {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+            } else {
+                if SMAppService.mainApp.status == .enabled {
+                    try SMAppService.mainApp.unregister()
+                }
+            }
+        } catch {
+            NSLog("Launch at login change failed: \(error)")
+        }
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        setLaunchAtLogin(!isLaunchAtLoginEnabled)
+        refreshLoginItemState()
+    }
+
+    private func refreshLoginItemState() {
+        loginMenuItem.state = isLaunchAtLoginEnabled ? .on : .off
+    }
+
     // MARK: - UI refresh
 
     private func refreshUI() {
@@ -126,6 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         muteMenuItem.title = muted ? "Unmute" : "Mute"
         muteMenuItem.state = muted ? .on : .off
 
+        refreshLoginItemState()
         updateStatusIcon()
     }
 
