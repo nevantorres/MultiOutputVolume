@@ -1,7 +1,8 @@
 import Cocoa
+import CoreAudio
 import ServiceManagement
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let audio = AudioController()
     private let mediaKeys = MediaKeyTap()
@@ -12,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var deviceMenuItem: NSMenuItem!
     private var muteMenuItem: NSMenuItem!
     private var loginMenuItem: NSMenuItem!
+    private var deviceSubmenu: NSMenu!
 
     /// Keyboard step: 1/16, matching macOS's default volume increment.
     private let step: Float = 1.0 / 16.0
@@ -46,9 +48,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        deviceMenuItem = NSMenuItem(title: "Output: —", action: nil, keyEquivalent: "")
+        deviceMenuItem = NSMenuItem(title: "Controlling: —", action: nil, keyEquivalent: "")
         deviceMenuItem.isEnabled = false
         menu.addItem(deviceMenuItem)
+
+        let deviceParent = NSMenuItem(title: "Control Device", action: nil, keyEquivalent: "")
+        deviceSubmenu = NSMenu()
+        deviceSubmenu.delegate = self
+        deviceParent.submenu = deviceSubmenu
+        menu.addItem(deviceParent)
 
         muteMenuItem = NSMenuItem(title: "Mute", action: #selector(toggleMute), keyEquivalent: "")
         muteMenuItem.target = self
@@ -67,7 +75,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quitItem.target = self
         menu.addItem(quitItem)
 
+        menu.delegate = self
         statusItem.menu = menu
+    }
+
+    // MARK: - Device dropdown (NSMenuDelegate)
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === deviceSubmenu {
+            rebuildDeviceSubmenu()
+        } else {
+            // Main menu opening — make sure the slider matches the live volume.
+            refreshUI()
+        }
+    }
+
+    private func rebuildDeviceSubmenu() {
+        deviceSubmenu.removeAllItems()
+
+        let follow = NSMenuItem(title: "Follow Default Output",
+                                action: #selector(selectFollowDefault), keyEquivalent: "")
+        follow.target = self
+        follow.state = (audio.manualDeviceID == nil) ? .on : .off
+        deviceSubmenu.addItem(follow)
+        deviceSubmenu.addItem(.separator())
+
+        for device in audio.allOutputDevices() {
+            let suffix = audio.isAggregate(device) ? "  (multi-output)" : ""
+            let item = NSMenuItem(title: audio.name(of: device) + suffix,
+                                  action: #selector(selectDevice(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = Int(device)
+            item.state = (audio.manualDeviceID == device) ? .on : .off
+            deviceSubmenu.addItem(item)
+        }
+    }
+
+    @objc private func selectFollowDefault() {
+        audio.manualDeviceID = nil
+        refreshUI()
+    }
+
+    @objc private func selectDevice(_ sender: NSMenuItem) {
+        audio.manualDeviceID = AudioDeviceID(sender.tag)
+        refreshUI()
     }
 
     private func makeSliderView() -> NSView {
@@ -168,7 +219,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         slider.doubleValue = Double(volume)
 
         let suffix = audio.isMultiOutput ? "  (multi-output)" : ""
-        deviceMenuItem.title = "Output: \(audio.deviceName)\(suffix)"
+        let mode = audio.manualDeviceID == nil ? "  ·  following default" : ""
+        deviceMenuItem.title = "Controlling: \(audio.deviceName)\(suffix)\(mode)"
         muteMenuItem.title = muted ? "Unmute" : "Mute"
         muteMenuItem.state = muted ? .on : .off
 

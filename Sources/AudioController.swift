@@ -33,8 +33,20 @@ final class AudioController {
         return deviceID
     }
 
+    /// When non-nil the app controls this specific device instead of following
+    /// the system default output. Reset automatically if the device disappears.
+    var manualDeviceID: AudioDeviceID?
+
+    /// The device the slider / keys actually drive.
+    var activeDevice: AudioDeviceID {
+        if let id = manualDeviceID, allOutputDevices().contains(id) {
+            return id
+        }
+        return defaultOutputDevice
+    }
+
     var deviceName: String {
-        name(of: defaultOutputDevice)
+        name(of: activeDevice)
     }
 
     func name(of device: AudioDeviceID) -> String {
@@ -50,9 +62,50 @@ final class AudioController {
         return nameRef.takeRetainedValue() as String
     }
 
-    /// True when the current default device is an aggregate / multi-output device.
+    /// True when the active device is an aggregate / multi-output device.
     var isMultiOutput: Bool {
-        transportType(of: defaultOutputDevice) == kAudioDeviceTransportTypeAggregate
+        isAggregate(activeDevice)
+    }
+
+    func isAggregate(_ device: AudioDeviceID) -> Bool {
+        transportType(of: device) == kAudioDeviceTransportTypeAggregate
+    }
+
+    /// All devices that have at least one output channel (the candidates for
+    /// the control dropdown), in the order Core Audio reports them.
+    func allOutputDevices() -> [AudioDeviceID] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: mainElement)
+        var size = UInt32(0)
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr else { return [] }
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var ids = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids.filter { outputChannelCount(of: $0) > 0 }
+    }
+
+    private func outputChannelCount(of device: AudioDeviceID) -> Int {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: outputScope,
+            mElement: mainElement)
+        var size = UInt32(0)
+        guard AudioObjectGetPropertyDataSize(device, &addr, 0, nil, &size) == noErr, size > 0 else {
+            return 0
+        }
+        let bufferList = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size),
+            alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { bufferList.deallocate() }
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, bufferList) == noErr else {
+            return 0
+        }
+        let abl = UnsafeMutableAudioBufferListPointer(
+            bufferList.assumingMemoryBound(to: AudioBufferList.self))
+        return abl.reduce(0) { $0 + Int($1.mNumberChannels) }
     }
 
     private func transportType(of device: AudioDeviceID) -> UInt32 {
@@ -156,7 +209,7 @@ final class AudioController {
 
     /// Reads a representative current volume from the first controllable element.
     var volume: Float {
-        let device = defaultOutputDevice
+        let device = activeDevice
         for target in targetDevices(for: device) {
             if let element = controllableElements(of: target).first {
                 return readScalar(target, element)
@@ -168,7 +221,7 @@ final class AudioController {
     @discardableResult
     func setVolume(_ value: Float) -> Bool {
         let clamped = max(0, min(1, value))
-        let device = defaultOutputDevice
+        let device = activeDevice
         var didSet = false
         for target in targetDevices(for: device) {
             for element in controllableElements(of: target) {
@@ -205,7 +258,7 @@ final class AudioController {
     // MARK: - Mute
 
     var isMuted: Bool {
-        let device = defaultOutputDevice
+        let device = activeDevice
         for target in targetDevices(for: device) {
             var muted = UInt32(0)
             var size = UInt32(MemoryLayout<UInt32>.size)
@@ -226,7 +279,7 @@ final class AudioController {
     }
 
     func setMuted(_ muted: Bool) {
-        let device = defaultOutputDevice
+        let device = activeDevice
         var value = UInt32(muted ? 1 : 0)
         for target in targetDevices(for: device) {
             var addr = AudioObjectPropertyAddress(
