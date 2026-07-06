@@ -27,8 +27,15 @@ Requires the Swift toolchain (Xcode or Command Line Tools).
 ## Permissions
 The slider works immediately. The **keyboard volume keys** need Accessibility
 access: System Settings → Privacy & Security → Accessibility → enable
-*MultiOutputVolume*, then quit and relaunch the app. (It will prompt you on
-first launch if the permission is missing.)
+*MultiOutputVolume*. The keys start working the instant you flip the switch —
+the app polls for the grant, so **no relaunch is needed**. (It prompts on first
+launch if the permission is missing.)
+
+The grant **persists across rebuilds**: `build.sh` signs every build with a
+stable, self-signed identity (created automatically on the first build and kept
+in a dedicated `multioutputvolume-signing` keychain), so macOS keeps recognising
+the app. You only need to grant Accessibility once — after the *first* build
+that introduces the new signature.
 
 ## Notes
 - Some sub-devices (e.g. certain digital/HDMI outputs) expose no volume control;

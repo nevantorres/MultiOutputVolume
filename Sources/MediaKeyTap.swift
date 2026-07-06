@@ -1,4 +1,5 @@
 import Cocoa
+import ApplicationServices
 
 /// Intercepts the hardware volume keys (F10/F11/F12 and Touch Bar) via a
 /// CGEventTap on NSSystemDefined events. When a key is handled the event is
@@ -22,8 +23,27 @@ final class MediaKeyTap {
     /// CGEventType has no public case for system-defined events; the raw value is 14.
     private let systemDefinedEventType = CGEventType(rawValue: 14)!
 
+    /// True once a working event tap has been installed.
+    var isRunning: Bool { eventTap != nil }
+
+    /// Whether this process is currently trusted for Accessibility. A CGEventTap
+    /// on keyboard/system events only *delivers* events when the process is
+    /// trusted, and — critically — trust is evaluated when the tap is created.
+    /// So we must not create the tap until this is true, and must (re)create it
+    /// once the user grants permission rather than assuming a relaunch.
+    var isTrusted: Bool { AXIsProcessTrusted() }
+
+    /// Installs the event tap. Idempotent: a no-op once already running.
+    /// Returns false (without side effects) when the process is not yet trusted,
+    /// so the caller can prompt for permission and retry later.
     @discardableResult
     func start() -> Bool {
+        if eventTap != nil { return true }
+
+        // Creating the tap while untrusted yields a dead tap that never revives,
+        // even after permission is later granted. Refuse until we're trusted.
+        guard AXIsProcessTrusted() else { return false }
+
         let mask = CGEventMask(1 << 14)
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             let tap = Unmanaged<MediaKeyTap>.fromOpaque(refcon!).takeUnretainedValue()
@@ -38,6 +58,7 @@ final class MediaKeyTap {
             callback: callback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
+            NSLog("MediaKeyTap: tapCreate failed even though the process is trusted.")
             return false
         }
 
@@ -46,6 +67,7 @@ final class MediaKeyTap {
         runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        NSLog("MediaKeyTap: media key tap installed.")
         return true
     }
 

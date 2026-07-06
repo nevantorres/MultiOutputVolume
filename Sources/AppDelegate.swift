@@ -1,6 +1,7 @@
 import Cocoa
 import CoreAudio
 import ServiceManagement
+import ApplicationServices
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
@@ -14,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var muteMenuItem: NSMenuItem!
     private var loginMenuItem: NSMenuItem!
     private var deviceSubmenu: NSMenu!
+    private var accessibilityPollTimer: Timer?
 
     /// Keyboard step: 1/16, matching macOS's default volume increment.
     private let step: Float = 1.0 / 16.0
@@ -151,7 +153,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mediaKeys.onMute = { [weak self] in self?.toggleMute() }
 
         if !mediaKeys.start() {
+            // Not yet trusted. Ask (via the system's own trust prompt, which adds
+            // the app to the Accessibility list), then poll so the keys start
+            // working the moment permission is granted — no relaunch required.
             promptForAccessibility()
+            beginWaitingForAccessibility()
+        }
+    }
+
+    /// Polls for the Accessibility grant and installs the media-key tap as soon
+    /// as it appears. A CGEventTap created while untrusted stays dead forever,
+    /// so retrying `start()` (which only creates the tap once trusted) is the
+    /// only reliable way to pick up a permission granted after launch.
+    private func beginWaitingForAccessibility() {
+        accessibilityPollTimer?.invalidate()
+        accessibilityPollTimer = Timer.scheduledTimer(
+            withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            if self.mediaKeys.start() {
+                timer.invalidate()
+                self.accessibilityPollTimer = nil
+            }
         }
     }
 
@@ -247,14 +269,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Permissions
 
     private func promptForAccessibility() {
+        // Ask the system to prompt and add us to the Accessibility list. This
+        // registers the *current* binary, avoiding a stale list entry that reads
+        // as "enabled" but no longer matches this build's signature.
+        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        _ = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+
         let alert = NSAlert()
         alert.messageText = "Accessibility Permission Needed"
         alert.informativeText = """
-            To use the keyboard volume keys, grant this app access in
-            System Settings → Privacy & Security → Accessibility,
-            then quit and relaunch.
+            To use the keyboard volume keys, enable this app in
+            System Settings → Privacy & Security → Accessibility.
 
-            The menu-bar slider works without this permission.
+            The keys start working as soon as you flip the switch — no
+            relaunch needed. The menu-bar slider works without this permission.
+
+            Tip: if the app is already listed but the keys still don't work
+            (common after rebuilding), toggle its switch off and back on.
             """
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Open System Settings")
