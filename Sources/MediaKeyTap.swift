@@ -7,8 +7,10 @@ import ApplicationServices
 /// volume handling. Requires Accessibility permission.
 final class MediaKeyTap {
 
-    var onVolumeUp: (() -> Void)?
-    var onVolumeDown: (() -> Void)?
+    /// The `fine` flag is true when Option+Shift is held, matching macOS's
+    /// quarter-step fine volume adjustment.
+    var onVolumeUp: ((_ fine: Bool) -> Void)?
+    var onVolumeDown: ((_ fine: Bool) -> Void)?
     var onMute: (() -> Void)?
 
     private var eventTap: CFMachPort?
@@ -75,6 +77,7 @@ final class MediaKeyTap {
         // Re-enable the tap if the system disabled it (e.g. after a timeout).
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            runOnMain { self.stopRepeating() }   // don't ramp on past a lost key-up
             return Unmanaged.passUnretained(event)
         }
 
@@ -88,22 +91,97 @@ final class MediaKeyTap {
         let keyCode = (data1 & 0xFFFF0000) >> 16
         let keyFlags = data1 & 0x0000FFFF
         let keyState = (keyFlags & 0xFF00) >> 8
-        let keyIsPressed = keyState == 0x0A   // 0x0A = down, 0x0B = up
+        let keyIsDown = keyState == 0x0A          // 0x0A = down, 0x0B = up
+        let keyIsRepeat = (keyFlags & 0x1) != 0   // system auto-repeat of a held key
 
-        guard keyIsPressed else { return Unmanaged.passUnretained(event) }
-
-        switch keyCode {
-        case keyTypeSoundUp:
-            DispatchQueue.main.async { self.onVolumeUp?() }
-            return nil
-        case keyTypeSoundDown:
-            DispatchQueue.main.async { self.onVolumeDown?() }
-            return nil
-        case keyTypeMute:
-            DispatchQueue.main.async { self.onMute?() }
-            return nil
-        default:
+        // Only intercept the three keys we handle; let everything else pass.
+        guard keyCode == keyTypeSoundUp
+                || keyCode == keyTypeSoundDown
+                || keyCode == keyTypeMute else {
             return Unmanaged.passUnretained(event)
         }
+
+        if keyCode == keyTypeMute {
+            // Toggle once per physical press; ignore repeats and the key-up.
+            if keyIsDown && !keyIsRepeat {
+                runOnMain { self.onMute?() }
+            }
+            return nil
+        }
+
+        // Volume up/down: drive our own smooth auto-repeat while held, rather
+        // than one step per tap. We ignore the system's repeat events and run a
+        // timer instead, so the ramp rate is consistent and quick.
+        if keyIsDown {
+            if !keyIsRepeat {
+                // Option+Shift = fine (quarter-step) adjustment, matching macOS.
+                let flags = event.flags
+                let fine = flags.contains(.maskAlternate) && flags.contains(.maskShift)
+                let action = keyCode == keyTypeSoundUp ? onVolumeUp : onVolumeDown
+                runOnMain { self.beginRepeating(action, fine: fine) }
+            }
+        } else {
+            runOnMain { self.stopRepeating() }
+        }
+        return nil
+    }
+
+    /// The event-tap callback already runs on the main thread, so run the work
+    /// synchronously to avoid a run-loop-cycle of latency — and to keep working
+    /// while a menu's tracking loop is up (which doesn't drain the main queue).
+    /// Falls back to an async hop only in the unexpected off-main case.
+    private func runOnMain(_ work: @escaping () -> Void) {
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
+    }
+
+    // MARK: - Press-and-hold auto-repeat
+
+    private var repeatTimer: Timer?
+    private var heldAction: ((Bool) -> Void)?
+    private var heldFine = false
+    private var repeatCount = 0
+
+    /// Interval between steps once the key has been held past the initial delay.
+    /// ~28 steps/s → full range in roughly half a second.
+    private let repeatInterval: TimeInterval = 0.035
+    /// Delay before a held key starts ramping, so a quick tap is a single step.
+    private let repeatDelay: TimeInterval = 0.25
+    /// Safety cap (~15 s of ramping) so a missed key-up can't run away.
+    private let maxRepeats = 400
+
+    private func beginRepeating(_ action: ((Bool) -> Void)?, fine: Bool) {
+        guard let action else { return }
+        stopRepeating()
+        heldAction = action
+        heldFine = fine
+        repeatCount = 0
+
+        action(fine)   // immediate first step
+
+        // Add timers in .common mode so the ramp keeps firing even while a menu
+        // is open (its tracking run-loop mode otherwise starves .default timers).
+        let delayTimer = Timer(timeInterval: repeatDelay, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            let ticker = Timer(timeInterval: self.repeatInterval, repeats: true) { [weak self] _ in
+                guard let self, let held = self.heldAction else { return }
+                self.repeatCount += 1
+                if self.repeatCount > self.maxRepeats { self.stopRepeating(); return }
+                held(self.heldFine)
+            }
+            self.repeatTimer = ticker
+            RunLoop.main.add(ticker, forMode: .common)
+        }
+        repeatTimer = delayTimer
+        RunLoop.main.add(delayTimer, forMode: .common)
+    }
+
+    private func stopRepeating() {
+        repeatTimer?.invalidate()
+        repeatTimer = nil
+        heldAction = nil
     }
 }

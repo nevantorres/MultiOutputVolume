@@ -15,6 +15,27 @@ final class AudioController {
     private let outputScope = kAudioObjectPropertyScopeOutput
     private let mainElement = kAudioObjectPropertyElementMain
 
+    /// Cache of each device's settable volume elements — the channel scan in
+    /// `controllableElements` is not free and runs on every get/set.
+    private var elementCache: [AudioDeviceID: [AudioObjectPropertyElement]] = [:]
+
+    /// Cache of an aggregate's resolved sub-devices — the UID translation in
+    /// `targetDevices` is comparatively slow and runs on every get/set.
+    private var targetCache: [AudioDeviceID: [AudioDeviceID]] = [:]
+
+    /// Bookkeeping for the emulated mute used on devices with no hardware mute
+    /// (aggregates / multi-output). `emulatedMuteDevice` records which device is
+    /// currently muted-by-zeroing so we can restore `preMuteVolume` on unmute.
+    private var emulatedMuteDevice: AudioDeviceID?
+    private var preMuteVolume: Float = 0
+    private let defaultUnmuteVolume: Float = 1.0 / 16.0
+
+    /// The level we intend the device to be at. Devices quantise the volume
+    /// scalar to their own grid, so reading it back between key steps drifts and
+    /// makes a held ramp uneven. We step from this intended value instead and
+    /// re-seed it from the device only when something external could change it.
+    private var pendingVolume: Float?
+
     init() {
         installDefaultDeviceListener()
     }
@@ -35,7 +56,9 @@ final class AudioController {
 
     /// When non-nil the app controls this specific device instead of following
     /// the system default output. Reset automatically if the device disappears.
-    var manualDeviceID: AudioDeviceID?
+    var manualDeviceID: AudioDeviceID? {
+        didSet { pendingVolume = nil }   // re-seed the level tracker for the new device
+    }
 
     /// The device the slider / keys actually drive.
     var activeDevice: AudioDeviceID {
@@ -125,6 +148,13 @@ final class AudioController {
     /// device that is just the device itself; for an aggregate/multi-output it
     /// is the list of sub-devices.
     private func targetDevices(for device: AudioDeviceID) -> [AudioDeviceID] {
+        if let cached = targetCache[device] { return cached }
+        let result = computeTargetDevices(for: device)
+        targetCache[device] = result
+        return result
+    }
+
+    private func computeTargetDevices(for device: AudioDeviceID) -> [AudioDeviceID] {
         guard transportType(of: device) == kAudioDeviceTransportTypeAggregate else {
             return [device]
         }
@@ -164,10 +194,19 @@ final class AudioController {
 
     // MARK: - Controllable volume elements
 
-    /// The channel elements on `device` that have a settable scalar volume.
+    /// The channel elements on `device` that have a settable scalar volume,
+    /// memoised per device (device configs rarely change, and the cache is
+    /// cleared whenever the hardware topology does).
+    private func controllableElements(of device: AudioDeviceID) -> [AudioObjectPropertyElement] {
+        if let cached = elementCache[device] { return cached }
+        let result = computeControllableElements(of: device)
+        elementCache[device] = result
+        return result
+    }
+
     /// Prefers the master element (0); falls back to the preferred stereo pair
     /// or an explicit channel scan.
-    private func controllableElements(of device: AudioDeviceID) -> [AudioObjectPropertyElement] {
+    private func computeControllableElements(of device: AudioDeviceID) -> [AudioObjectPropertyElement] {
         if isVolumeSettable(device, mainElement) { return [mainElement] }
 
         var elements: [AudioObjectPropertyElement] = []
@@ -218,19 +257,32 @@ final class AudioController {
         return 0
     }
 
+    /// Sets the volume on every controllable element and returns the value that
+    /// was actually applied (clamped), so callers can update the UI without a
+    /// second round-trip through Core Audio.
     @discardableResult
-    func setVolume(_ value: Float) -> Bool {
+    func setVolume(_ value: Float) -> Float {
         let clamped = max(0, min(1, value))
         let device = activeDevice
-        var didSet = false
         for target in targetDevices(for: device) {
             for element in controllableElements(of: target) {
-                if writeScalar(target, element, clamped) { didSet = true }
+                writeScalar(target, element, clamped)
             }
         }
-        // Unmute when the user raises volume above zero.
-        if clamped > 0 { setMuted(false) }
-        return didSet
+        pendingVolume = clamped
+        // The user set an explicit level, so just drop any mute state — don't
+        // restore a saved pre-mute volume over the value we just wrote.
+        if clamped > 0 { clearMuteState() }
+        return clamped
+    }
+
+    /// Steps the volume by `delta` from the intended level (not a re-read of the
+    /// device), giving even increments when a key is held down. Returns the new
+    /// applied level.
+    @discardableResult
+    func nudgeVolume(by delta: Float) -> Float {
+        let base = pendingVolume ?? volume
+        return setVolume(base + delta)
     }
 
     private func readScalar(_ device: AudioDeviceID, _ element: AudioObjectPropertyElement) -> Float {
@@ -267,11 +319,13 @@ final class AudioController {
                 mScope: outputScope,
                 mElement: mainElement)
             if AudioObjectHasProperty(target, &addr),
-               AudioObjectGetPropertyData(target, &addr, 0, nil, &size, &muted) == noErr {
-                return muted != 0
+               AudioObjectGetPropertyData(target, &addr, 0, nil, &size, &muted) == noErr,
+               muted != 0 {
+                return true
             }
         }
-        return false
+        // No hardware mute reported it as muted — fall back to our emulated state.
+        return emulatedMuteDevice == device
     }
 
     func toggleMute() {
@@ -280,26 +334,61 @@ final class AudioController {
 
     func setMuted(_ muted: Bool) {
         let device = activeDevice
-        var value = UInt32(muted ? 1 : 0)
-        for target in targetDevices(for: device) {
-            var addr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyMute,
-                mScope: outputScope,
-                mElement: mainElement)
-            var settable: DarwinBoolean = false
-            if AudioObjectHasProperty(target, &addr),
-               AudioObjectIsPropertySettable(target, &addr, &settable) == noErr,
-               settable.boolValue {
-                AudioObjectSetPropertyData(
-                    target, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
-            } else if muted {
-                // Device has no mute control (common for aggregates): emulate by
-                // dropping volume to zero. Unmute is handled by restoring volume.
+        let targets = targetDevices(for: device)
+
+        if muted {
+            // Capture a representative level before any emulation zeroes it.
+            let current = volume
+            var emulated = false
+            for target in targets where !setHardwareMute(target, true) {
+                // No hardware mute (common for aggregates): emulate by zeroing.
                 for element in controllableElements(of: target) {
                     writeScalar(target, element, 0)
                 }
+                emulated = true
             }
+            if emulated {
+                preMuteVolume = current
+                emulatedMuteDevice = device
+            }
+        } else {
+            for target in targets where !setHardwareMute(target, false) {
+                // Restore the pre-mute level we emulated our way down from.
+                guard emulatedMuteDevice == device else { continue }
+                let restore = preMuteVolume > 0 ? preMuteVolume : defaultUnmuteVolume
+                for element in controllableElements(of: target) {
+                    writeScalar(target, element, restore)
+                }
+            }
+            if emulatedMuteDevice == device { emulatedMuteDevice = nil }
         }
+    }
+
+    /// Sets a device's hardware mute if it exposes a settable one. Returns
+    /// whether it did — `false` means the device has no hardware mute to control
+    /// and the caller should emulate it.
+    @discardableResult
+    private func setHardwareMute(_ device: AudioDeviceID, _ muted: Bool) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: outputScope,
+            mElement: mainElement)
+        var settable: DarwinBoolean = false
+        guard AudioObjectHasProperty(device, &addr),
+              AudioObjectIsPropertySettable(device, &addr, &settable) == noErr,
+              settable.boolValue else { return false }
+        var value = UInt32(muted ? 1 : 0)
+        return AudioObjectSetPropertyData(
+            device, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value) == noErr
+    }
+
+    /// Clears mute (hardware and emulated) *without* restoring a saved level —
+    /// used when the user has just set an explicit non-zero volume.
+    private func clearMuteState() {
+        for target in targetDevices(for: activeDevice) {
+            setHardwareMute(target, false)
+        }
+        emulatedMuteDevice = nil
     }
 
     // MARK: - Default device change listener
@@ -312,7 +401,12 @@ final class AudioController {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: mainElement)
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            DispatchQueue.main.async { self?.onDeviceChanged?() }
+            DispatchQueue.main.async {
+                self?.elementCache.removeAll()
+                self?.targetCache.removeAll()
+                self?.pendingVolume = nil
+                self?.onDeviceChanged?()
+            }
         }
         listenerBlock = block
         AudioObjectAddPropertyListenerBlock(

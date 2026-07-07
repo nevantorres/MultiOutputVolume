@@ -13,8 +13,7 @@ underlying sub-device instead, so one control moves them all together.
 ## Features
 - Speaker icon + **slider** in the menu bar.
 - **Volume Up / Down / Mute** hardware keys work (and the broken system handling
-  is suppressed).
-- On-screen HUD when you use the keys.
+  is suppressed). Hold to ramp; the menu-bar speaker icon reflects the level.
 - Follows the default output device automatically; works for normal devices too.
 
 ## Build

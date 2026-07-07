@@ -7,7 +7,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let audio = AudioController()
     private let mediaKeys = MediaKeyTap()
-    private let hud = VolumeHUD()
 
     private var statusItem: NSStatusItem!
     private var slider: NSSlider!
@@ -148,8 +147,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Media keys
 
     private func setupMediaKeys() {
-        mediaKeys.onVolumeUp = { [weak self] in self?.nudge(up: true) }
-        mediaKeys.onVolumeDown = { [weak self] in self?.nudge(up: false) }
+        mediaKeys.onVolumeUp = { [weak self] fine in self?.nudge(up: true, fine: fine) }
+        mediaKeys.onVolumeDown = { [weak self] fine in self?.nudge(up: false, fine: fine) }
         mediaKeys.onMute = { [weak self] in self?.toggleMute() }
 
         if !mediaKeys.start() {
@@ -168,7 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func beginWaitingForAccessibility() {
         accessibilityPollTimer?.invalidate()
         accessibilityPollTimer = Timer.scheduledTimer(
-            withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            withTimeInterval: 2.0, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
             if self.mediaKeys.start() {
                 timer.invalidate()
@@ -177,25 +176,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func nudge(up: Bool) {
-        let current = audio.volume
-        let next = up ? current + step : current - step
-        audio.setVolume(next)
-        refreshUI()
-        hud.show(volume: audio.volume, muted: audio.isMuted)
+    private func nudge(up: Bool, fine: Bool) {
+        let increment = fine ? step / 4 : step
+        // Step from the intended level (not a device re-read) so a held ramp is
+        // even; devices quantise the scalar and reading it back drifts.
+        let applied = audio.nudgeVolume(by: up ? increment : -increment)
+        let muted = audio.isMuted
+
+        // Lightweight update straight from the applied value — no menu is open
+        // during a keypress, so the full refreshUI() isn't needed.
+        slider.doubleValue = Double(applied)
+        updateStatusIcon(volume: applied, muted: muted)
     }
 
     // MARK: - Actions
 
     @objc private func sliderChanged(_ sender: NSSlider) {
-        audio.setVolume(Float(sender.doubleValue))
-        updateStatusIcon()
+        let applied = audio.setVolume(Float(sender.doubleValue))
+        updateStatusIcon(volume: applied, muted: audio.isMuted)
     }
 
     @objc private func toggleMute() {
         audio.toggleMute()
         refreshUI()
-        hud.show(volume: audio.volume, muted: audio.isMuted)
     }
 
     @objc private func quit() {
@@ -247,12 +250,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         muteMenuItem.state = muted ? .on : .off
 
         refreshLoginItemState()
-        updateStatusIcon()
+        updateStatusIcon(volume: volume, muted: muted)
     }
 
-    private func updateStatusIcon() {
-        let volume = audio.volume
-        let muted = audio.isMuted
+    private func updateStatusIcon(volume: Float, muted: Bool) {
         let symbol: String
         if muted || volume == 0 {
             symbol = "speaker.slash.fill"
